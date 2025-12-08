@@ -1,0 +1,15 @@
+services:
+
+  monitor:
+    build:
+      context: .
+      dockerfile: Dockerfile.monitor
+    container_name: wxbot-monitor
+    restart: always
+    environment:
+      - PYTHONUNBUFFERED=1
+      - MONITOR_INTERVAL=300
+      - HEADLESS=true
+    volumes:
+      - ./scripts:/scripts
+    working_dir: /scripts

@@ -1,0 +1,73 @@
+FROM python:3.11-slim
+
+# 避免交互安装
+ENV DEBIAN_FRONTEND=noninteractive
+
+# 安装 Chromium 和 chromedriver 及运行所需依赖
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+       ca-certificates \
+       gnupg \
+       wget \
+       unzip \
+       fonts-liberation \
+       libnss3 \
+       libx11-6 \
+       libxcomposite1 \
+       libxdamage1 \
+       libxrandr2 \
+       libxss1 \
+       libasound2 \
+       libatk1.0-0 \
+       libatk-bridge2.0-0 \
+       libcups2 \
+       libxkbcommon0 \
+       xdg-utils \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Chromium from Debian repos (may be chromium or chromium-browser)
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends chromium \
+    || apt-get install -y --no-install-recommends chromium-browser \
+    && rm -rf /var/lib/apt/lists/*
+
+# Try to install chromedriver matching the Chromium version
+# We'll attempt to download chromedriver via matching Chrome version; as fallback use package
+RUN CHROME_PATH=$(which chromium || which chromium-browser || true) \
+    && if [ -n "$CHROME_PATH" ]; then \
+         CHROME_VERSION=$($CHROME_PATH --version | awk '{print $3}'); \
+         CHROME_MAJOR=$(echo $CHROME_VERSION | cut -d. -f1); \
+         echo "Detected chromium version: $CHROME_VERSION (major $CHROME_MAJOR)"; \
+         # Try fetch chromedriver by major version
+         DRIVER_ZIP="chromedriver_linux64.zip"; \
+         DL_URL="https://chromedriver.storage.googleapis.com/LATEST_RELEASE_${CHROME_MAJOR}"; \
+         LATEST=$(wget -qO- $DL_URL 2>/dev/null || true); \
+         if [ -n "$LATEST" ]; then \
+             wget -q -O /tmp/${DRIVER_ZIP} https://chromedriver.storage.googleapis.com/${LATEST}/${DRIVER_ZIP} || true; \
+             unzip -q /tmp/${DRIVER_ZIP} -d /usr/local/bin || true; \
+             chmod +x /usr/local/bin/chromedriver || true; \
+         fi \
+    fi || true
+
+# Lastly try apt chromedriver package (best-effort)
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends chromium-driver || true \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create non-root user
+RUN useradd -m monitor
+WORKDIR /home/monitor
+
+# Copy scripts
+COPY ./scripts /scripts
+RUN chown -R monitor:monitor /scripts
+
+# Install python deps (if any; keep minimal)
+RUN pip install --no-cache-dir selenium requests pyyaml python-dotenv pytz
+
+# Switch to non-root
+USER monitor
+
+ENV PATH="/usr/local/bin:$PATH"
+
+CMD ["/bin/sh", "-c", "while true; do python /scripts/monitor_appointment.py || true; sleep ${MONITOR_INTERVAL:-300}; done"]

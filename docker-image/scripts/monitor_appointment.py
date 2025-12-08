@@ -4,10 +4,12 @@ import time
 import requests
 import yaml
 import logging
+import json
 from datetime import datetime
 from pathlib import Path
 import pytz
 from dotenv import load_dotenv
+from typing import Dict, List, Tuple, Optional, Union
 
 # 加载 .env 文件
 load_dotenv()
@@ -16,6 +18,13 @@ load_dotenv()
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.chrome.options import Options
+from selenium.webdriver import ActionChains
+from selenium.common.exceptions import (
+    ElementClickInterceptedException,
+    WebDriverException,
+    NoSuchElementException,
+    TimeoutException,
+)
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 
@@ -26,19 +35,16 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # === 配置部分 (请在此处修改目标URL和判断逻辑) ===
-TARGET_URL = "https://tyggl.nankai.edu.cn/Views/User/User.html"  # 目标页面URL
+TARGET_URL = os.environ.get("TARGET_URL")  # 目标页面URL
 CHECK_INTERVAL = 60  # 检查间隔(秒)
 
-# 判断逻辑配置
-# 如果页面包含此关键词，表示有空余 (例如: "可预约", "Available", "有号")
-SUCCESS_KEYWORDS = ["可预约", "有号", "Available"]
-# 如果页面包含此关键词，表示已满 (例如: "已满", "Sold Out")
-FAILURE_KEYWORDS = ["已满", "Sold Out", "暂无"]
+# cookies 保存路径（与 docker-compose 的 ./data 挂载一致）
+COOKIES_PATH = Path("./data/browser_cookies.json")
 
 # === 核心功能 ===
 
 
-def get_check_days_count():
+def get_check_days_count() -> int:
     """
     根据当前时间确定需要监控的天数
     规则: 18:00之前只能预定今天及之后两天(共3天)，18:00之后可以预定今天及之后三天(共4天)
@@ -48,6 +54,112 @@ def get_check_days_count():
         return 3
     else:
         return 4
+
+
+def get_beijing_time():
+    """获取北京时间"""
+    return datetime.now(pytz.timezone("Asia/Shanghai"))
+
+
+def process_report_data(report_data: Dict, report_type: str = "text"):
+    """处理报告数据，生成文本内容"""
+    if report_type == "text":
+        content = report_data.get("message", "")
+        include_morning = os.environ.get("INCLUDE_MORNING", "false").lower() == "true"
+        if not include_morning:
+            # 过滤掉包含“上午”的行
+            filtered_lines = [
+                line for line in content.split("\n") if "上午" not in line
+            ]
+            content = "\n".join(filtered_lines)
+
+        return content
+    return report_data
+
+
+def save_cookies(driver, path: Path = COOKIES_PATH) -> None:
+    """将当前浏览器 cookies 保存到文件，以便下次恢复登录状态"""
+    try:
+        cookies = driver.get_cookies()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(cookies, f, ensure_ascii=False)
+        logger.info(f"已保存 cookies 到 {path}")
+    except Exception as e:
+        logger.warning(f"保存 cookies 失败: {e}")
+
+
+def load_cookies(driver, url: str, path: Path = COOKIES_PATH) -> bool:
+    """
+    尝试从文件加载 cookies 并注入到浏览器。
+    按 cookie 的 domain 分组，逐域打开页面注入以满足同源限制。
+    返回 True 表示至少注入了一个 cookie。
+    """
+    if not path.exists():
+        return False
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            cookies = json.load(f)
+    except Exception as e:
+        logger.warning(f"读取 cookies 失败: {e}")
+        return False
+
+    try:
+        # 按域分组 cookie
+        domains = {}
+        for c in cookies:
+            dom = c.get("domain") or ""
+            dom = dom.lstrip(".")
+            if not dom:
+                try:
+                    dom = url.split("//", 1)[1].split("/", 1)[0]
+                except Exception:
+                    dom = ""
+            domains.setdefault(dom, []).append(c)
+
+        total = len(cookies)
+        injected = 0
+
+        for dom, ck_list in domains.items():
+            if not dom:
+                continue
+            tried = False
+            for scheme in ("https://", "http://"):
+                target = f"{scheme}{dom}"
+                try:
+                    driver.get(target)
+                    time.sleep(1)
+                    tried = True
+                    break
+                except Exception:
+                    continue
+            if not tried:
+                logger.debug(f"无法打开域以注入 cookie: {dom}")
+                continue
+
+            for c in ck_list:
+                cookie = {k: v for k, v in c.items() if k not in ("sameSite",)}
+                if "expiry" in cookie:
+                    try:
+                        cookie["expiry"] = int(cookie["expiry"])
+                    except Exception:
+                        cookie.pop("expiry", None)
+                try:
+                    driver.add_cookie(cookie)
+                    injected += 1
+                except Exception as e:
+                    logger.debug(f"注入 cookie 到域 {dom} 失败: {e}")
+
+        try:
+            driver.refresh()
+        except Exception:
+            pass
+
+        logger.info(f"尝试注入 cookies: 总共 {total} 个，成功注入 {injected} 个")
+        return injected > 0
+    except Exception as e:
+        logger.warning(f"注入 cookies 时出错: {e}")
+        return False
 
 
 def check_dates_availability(driver):
@@ -200,27 +312,51 @@ def get_webhooks():
     return {"feishu": feishu_url, "wework": wework_url}
 
 
-def send_feishu(webhook_url, title, content, url=None):
-    """发送飞书通知"""
-    if not webhook_url:
-        return
-
+def send_to_feishu(
+    webhook_url: str,
+    report_data: Dict,
+    report_type: str,
+    proxy_url: Optional[str] = None,
+) -> bool:
+    """发送到飞书（支持分批发送）"""
     headers = {"Content-Type": "application/json"}
+    proxies = None
+    if proxy_url:
+        proxies = {"http": proxy_url, "https": proxy_url}
 
-    text_content = f"{title}\n\n{content}"
-    if url:
-        text_content += f"\n\n链接: {url}"
+    content = process_report_data(report_data, report_type)
+    if not content:
+        print(f"无内容可发送到飞书 [{report_type}]，跳过发送")
+        return True
 
-    payload = {"msg_type": "text", "content": {"text": text_content}}
+    payload = {
+        "msg_type": "text",
+        "content": {
+            "text": content,
+        },
+    }
 
     try:
-        response = requests.post(webhook_url, headers=headers, json=payload, timeout=10)
-        if response.status_code == 200 and response.json().get("code") == 0:
-            logger.info("飞书通知发送成功")
+        response = requests.post(
+            webhook_url, headers=headers, json=payload, proxies=proxies, timeout=30
+        )
+        if response.status_code == 200:
+            result = response.json()
+            # 检查飞书的响应状态
+            if result.get("StatusCode") == 0 or result.get("code") == 0:
+                print(f"飞书发送成功 [{report_type}]")
+            else:
+                error_msg = result.get("msg") or result.get("StatusMessage", "未知错误")
+                print(f"飞书发送失败 [{report_type}]，错误：{error_msg}")
+                return False
         else:
-            logger.error(f"飞书通知发送失败: {response.text}")
+            print(f"飞书发送失败 [{report_type}]，状态码：{response.status_code}")
+            return False
     except Exception as e:
-        logger.error(f"发送飞书通知出错: {e}")
+        print(f"飞书发送出错 [{report_type}]：{e}")
+        return False
+
+    return True
 
 
 def send_wework(webhook_url, title, content, url=None):
@@ -269,13 +405,67 @@ def handle_login_process(driver):
         # 2. 处理用户须知界面
         logger.info("正在查找'同意协议'按钮...")
 
+        # 通用安全点击方法：等待可见 -> 滚动 -> 常规点击 -> JS 点击 -> ActionChains 点击（重试）
+        def safe_click(el, retries: int = 3):
+            last_exc = None
+            for attempt in range(retries):
+                try:
+                    # 确保元素在视窗内
+                    try:
+                        driver.execute_script(
+                            "arguments[0].scrollIntoView({block: 'center'});", el
+                        )
+                    except Exception:
+                        pass
+                    time.sleep(0.2)
+                    el.click()
+                    return True
+                except ElementClickInterceptedException as e:
+                    last_exc = e
+                    try:
+                        # 尝试 JS 点击（绕过遮挡）
+                        driver.execute_script("arguments[0].click();", el)
+                        return True
+                    except Exception as e2:
+                        last_exc = e2
+                        try:
+                            # 尝试使用 ActionChains
+                            ActionChains(driver).move_to_element(el).click().perform()
+                            return True
+                        except Exception as e3:
+                            last_exc = e3
+                            time.sleep(0.5)
+                            continue
+                except WebDriverException as e:
+                    last_exc = e
+                    try:
+                        driver.execute_script("arguments[0].click();", el)
+                        return True
+                    except Exception as e2:
+                        last_exc = e2
+                        time.sleep(0.5)
+                        continue
+            logger.debug(f"safe_click 最终失败: {last_exc}")
+            return False
+
         # 尝试点击协议勾选框 (根据用户提供的元素特征)
         try:
             # 查找 id="iconxy" 的 i 标签
             agreement_checkbox = driver.find_elements(By.ID, "iconxy")
             if agreement_checkbox:
                 logger.info("找到协议勾选框(id='iconxy')，正在点击...")
-                agreement_checkbox[0].click()
+                if not safe_click(agreement_checkbox[0]):
+                    logger.warning(
+                        "尝试通过多种方式点击协议勾选框失败，后续将尝试通过 label 或 JS 变更属性"
+                    )
+                    # 备用：尝试通过 JS 设置选中状态（如果是伪复选框）
+                    try:
+                        driver.execute_script(
+                            "arguments[0].classList.add('checked');",
+                            agreement_checkbox[0],
+                        )
+                    except Exception:
+                        pass
                 time.sleep(1)
             else:
                 # 备用：通过 label 文本查找前一个 i 标签
@@ -285,7 +475,14 @@ def handle_login_process(driver):
                     "//label[contains(text(), '我已阅读并同意')]/preceding-sibling::i",
                 )
                 if agreement_checkbox:
-                    agreement_checkbox[0].click()
+                    if not safe_click(agreement_checkbox[0]):
+                        logger.warning("通过文本定位到的勾选框点击失败，尝试 JS 点击")
+                        try:
+                            driver.execute_script(
+                                "arguments[0].click();", agreement_checkbox[0]
+                            )
+                        except Exception:
+                            logger.debug("JS 点击也失败，继续")
                     time.sleep(1)
         except Exception as e:
             logger.warning(f"点击协议勾选框时出错: {e}")
@@ -296,7 +493,12 @@ def handle_login_process(driver):
             next_button = driver.find_elements(By.ID, "apay")
             if next_button:
                 logger.info("找到'下一步'按钮(id='apay')，正在点击...")
-                next_button[0].click()
+                if not safe_click(next_button[0]):
+                    logger.warning("点击 '下一步' 按钮失败，尝试 JS 点击")
+                    try:
+                        driver.execute_script("arguments[0].click();", next_button[0])
+                    except Exception as e:
+                        logger.warning(f"使用 JS 点击 '下一步' 失败: {e}")
                 time.sleep(3)
             else:
                 # 备用：通过文本查找
@@ -474,17 +676,64 @@ def check_availability():
 
         # chrome_options.add_argument("--headless")  # 调试时注释掉，运行时开启可后台运行
         chrome_options.add_argument("--disable-gpu")
+        # 减少内存占用和共享内存问题
+        chrome_options.add_argument("--disable-dev-shm-usage")
         chrome_options.add_argument("--no-sandbox")
         # 忽略证书错误
         chrome_options.add_argument("--ignore-certificate-errors")
+
+        # headless 支持（在 monitor 容器中通常启用）
+        headless_env = os.environ.get("HEADLESS", "true").lower()
+        if headless_env in ("1", "true", "yes"):
+            # 使用新的 headless 模式（Chrome 109+ 支持）
+            try:
+                chrome_options.add_argument("--headless=new")
+            except Exception:
+                chrome_options.add_argument("--headless")
+
+        # 可选：使用持久化 Chrome profile 来保存登录状态（比单独注入 cookies 更稳健）
+        use_profile = os.environ.get("USE_CHROME_PROFILE", "false").lower() in (
+            "1",
+            "true",
+            "yes",
+        )
+        if use_profile:
+            profile_dir = os.environ.get("CHROME_PROFILE_DIR", "./data/chrome_profile")
+            try:
+                chrome_options.add_argument(
+                    f"--user-data-dir={Path(profile_dir).as_posix()}"
+                )
+                logger.info(f"启用 Chrome profile：{profile_dir}")
+            except Exception as e:
+                logger.warning(f"启用 Chrome profile 失败: {e}")
+        # 如果容器里装了 chromium，指定二进制路径以避免找不到浏览器
+        for bin_path in (
+            "/usr/bin/chromium",
+            "/usr/bin/chromium-browser",
+            "/usr/bin/google-chrome-stable",
+        ):
+            if Path(bin_path).exists():
+                try:
+                    chrome_options.binary_location = bin_path
+                    logger.info(f"使用浏览器二进制: {bin_path}")
+                    break
+                except Exception:
+                    pass
 
         # 初始化浏览器
         # 注意：需要安装 Chrome 浏览器和对应版本的 ChromeDriver，或者安装 selenium>=4.6.0 自动管理
         logger.info("启动浏览器...")
         driver = webdriver.Chrome(options=chrome_options)
 
-        logger.info(f"正在访问页面: {TARGET_URL}")
-        driver.get(TARGET_URL)
+        # 初始化后尝试加载 cookies（若存在），以恢复登录状态；若未加载再访问目标页面
+        try:
+            loaded = load_cookies(driver, TARGET_URL)
+        except Exception:
+            loaded = False
+
+        if not loaded:
+            logger.info(f"未找到或无法加载 cookies，访问页面: {TARGET_URL}")
+            driver.get(TARGET_URL)
 
         # 等待页面加载
         time.sleep(5)
@@ -511,6 +760,11 @@ def check_availability():
             logger.error("错误: 仍检测到登录框，登录失败")
         else:
             logger.info("登录框已消失，登录流程已完成")
+            # 登录成功后保存 cookies 以便下次复用
+            try:
+                save_cookies(driver)
+            except Exception:
+                logger.debug("保存 cookies 时发生异常，已忽略")
         # ===================
 
         # 导航到目标场馆
@@ -531,39 +785,37 @@ def check_availability():
         print("结束检查")
 
 
+def check_time_availability():
+    """检查当前时间是否在允许预约的时间范围内"""
+    now = get_beijing_time()
+    hour = now.hour
+
+    begin_hour = int(os.environ.get("BEGIN_HOUR", 8))
+    end_hour = int(os.environ.get("END_HOUR", 21))
+
+    # 允许预约的时间段：早上6点到晚上10点
+    if begin_hour <= hour < end_hour:
+        return True
+    else:
+        return False
+
+
 def main():
+    time_state = check_time_availability()
+    if not time_state:
+        logger.info("当前时间不在允许预约的时间范围内，跳过本次检查")
+        return
+
     logger.info("开始监控预约页面...")
     webhooks = get_webhooks()
 
     if not webhooks["feishu"] and not webhooks["wework"]:
         logger.warning("未配置飞书或企业微信Webhook，仅在控制台输出结果")
 
-    last_success_time = 0
-    notification_interval = 3600  # 成功后每小时提醒一次，避免轰炸
-
     # while True:
     try:
         is_available, message = check_availability()
         print(is_available, message)
-
-        # if is_available:
-        #     logger.info(f"【好消息】{message}")
-
-        #     current_time = time.time()
-        #     # 控制发送频率
-        #     # if current_time - last_success_time > notification_interval:
-        #     #     title = "🎉 发现预约名额"
-        #     #     content = f"检测时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n状态: {message}"
-
-        #     #     if webhooks["feishu"]:
-        #     #         send_feishu(webhooks["feishu"], title, content, TARGET_URL)
-
-        #     #     if webhooks["wework"]:
-        #     #         send_wework(webhooks["wework"], title, content, TARGET_URL)
-
-        #     #     last_success_time = current_time
-        # else:
-        #     logger.info(f"【监控中】{message}")
 
     except KeyboardInterrupt:
         logger.info("停止监控")
@@ -571,7 +823,21 @@ def main():
     except Exception as e:
         logger.error(f"运行出错: {e}")
 
-        # time.sleep(CHECK_INTERVAL)
+    if is_available:
+        report_data = {"message": message}
+        if webhooks["feishu"]:
+            send_to_feishu(
+                webhooks["feishu"],
+                report_data,
+                report_type="text",
+            )
+        if webhooks["wework"]:
+            send_wework(
+                webhooks["wework"],
+                title="羽毛球场地有名额！",
+                content=message,
+                url=TARGET_URL,
+            )
 
 
 if __name__ == "__main__":

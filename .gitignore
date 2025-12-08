@@ -1,1 +1,8 @@
 .vscode
+
+*.apk
+/virtual_machine/
+
+.env
+
+browser_cookies.json
