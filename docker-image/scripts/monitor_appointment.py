@@ -330,9 +330,21 @@ def send_to_feishu(
         return True
 
     payload = {
-        "msg_type": "text",
+        "msg_type": "post",
         "content": {
-            "text": content,
+            "post": {
+                "zh_cn": {
+                    "title": "羽毛球场地剩余",
+                    "content": [
+                        [
+                            {
+                                "tag": "text",
+                                "text": content,
+                            }
+                        ]
+                    ],
+                }
+            },
         },
     }
 
