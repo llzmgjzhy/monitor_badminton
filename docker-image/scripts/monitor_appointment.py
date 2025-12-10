@@ -41,6 +41,14 @@ CHECK_INTERVAL = 60  # 检查间隔(秒)
 # cookies 保存路径（与 docker-compose 的 ./data 挂载一致）
 COOKIES_PATH = Path("./data/browser_cookies.json")
 
+# 已提醒记忆文件（用于抑制重复提醒），建议在 compose 中挂载 `./data:/data`
+MEMORY_PATH = Path("./data/seen_slots.json")
+# 在同一天内允许的提醒次数阈值（超过该值后将抑制后续提醒），默认允许2次（即第1、2次会提醒，第3次开始抑制）
+try:
+    MEMORY_THRESHOLD = int(os.environ.get("MEMORY_THRESHOLD", "2"))
+except Exception:
+    MEMORY_THRESHOLD = 2
+
 # === 核心功能 ===
 
 
@@ -160,6 +168,84 @@ def load_cookies(driver, url: str, path: Path = COOKIES_PATH) -> bool:
     except Exception as e:
         logger.warning(f"注入 cookies 时出错: {e}")
         return False
+
+
+def load_memory(path: Path = None) -> dict:
+    """加载已提醒记忆文件，返回 dict: {slot_id: {count:int, last_seen: 'YYYY-MM-DD'}}"""
+    if path is None:
+        path = MEMORY_PATH
+    try:
+        if not path.exists():
+            return {}
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            if isinstance(data, dict):
+                return data
+            return {}
+    except Exception as e:
+        logger.warning(f"读取提醒记忆失败: {e}")
+        return {}
+
+
+def save_memory(mem: dict, path: Path = None) -> None:
+    if path is None:
+        path = MEMORY_PATH
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(mem, f, ensure_ascii=False)
+    except Exception as e:
+        logger.warning(f"保存提醒记忆失败: {e}")
+
+
+def filter_messages_by_memory(
+    messages: List[str], threshold: int = None
+) -> Tuple[List[str], dict]:
+    """根据记忆过滤 messages。
+    messages: 原始每行消息列表（每行代表一个场地/时间的字符串），
+    返回 (to_notify_list, updated_memory_dict)。
+    逻辑：同一天内每个 slot_id 记录 count；当 count > threshold 时抑制该条消息。
+    """
+    if threshold is None:
+        threshold = MEMORY_THRESHOLD
+    today = get_beijing_time().strftime("%Y-%m-%d")
+    mem = load_memory()
+    updated = dict(mem)  # shallow copy
+    to_notify = []
+
+    for m in messages:
+        slot_id = m.strip()
+        if not slot_id:
+            continue
+
+        entry = updated.get(slot_id)
+        if entry and entry.get("last_seen") == today:
+            count = int(entry.get("count", 0)) + 1
+        else:
+            count = 1
+
+        # 保存/更新内存
+        updated[slot_id] = {"count": count, "last_seen": today}
+
+        # 当 count <= threshold 时发送提醒，否则抑制
+        if count <= threshold:
+            to_notify.append(slot_id)
+
+    # 清理：移除非今天的条目，避免文件膨胀
+    keys_to_delete = []
+    for k, v in list(updated.items()):
+        if v.get("last_seen") != today:
+            keys_to_delete.append(k)
+    for k in keys_to_delete:
+        updated.pop(k, None)
+
+    # 持久化
+    try:
+        save_memory(updated)
+    except Exception:
+        logger.debug("保存提醒记忆时发生异常")
+
+    return to_notify, updated
 
 
 def check_dates_availability(driver):
@@ -306,10 +392,19 @@ def get_webhooks():
     """获取Webhook URL"""
     webhooks = load_config()
 
-    feishu_url = os.environ.get("FEISHU_WEBHOOK_URL") or webhooks.get("feishu_url")
+    feishu_url_group = os.environ.get("FEISHU_WEBHOOK_URL_GROUP") or webhooks.get(
+        "feishu_url_group"
+    )
+    feishu_url_person = os.environ.get("FEISHU_WEBHOOK_URL_PERSON") or webhooks.get(
+        "feishu_url_person"
+    )
     wework_url = os.environ.get("WEWORK_WEBHOOK_URL") or webhooks.get("wework_url")
 
-    return {"feishu": feishu_url, "wework": wework_url}
+    return {
+        "feishu_group": feishu_url_group,
+        "feishu_person": feishu_url_person,
+        "wework": wework_url,
+    }
 
 
 def send_to_feishu(
@@ -317,6 +412,7 @@ def send_to_feishu(
     report_data: Dict,
     report_type: str,
     proxy_url: Optional[str] = None,
+    rich_text: bool = True,
 ) -> bool:
     """发送到飞书（支持分批发送）"""
     headers = {"Content-Type": "application/json"}
@@ -329,24 +425,32 @@ def send_to_feishu(
         print(f"无内容可发送到飞书 [{report_type}]，跳过发送")
         return True
 
-    payload = {
-        "msg_type": "post",
-        "content": {
-            "post": {
-                "zh_cn": {
-                    "title": "羽毛球场地剩余",
-                    "content": [
-                        [
-                            {
-                                "tag": "text",
-                                "text": content,
-                            }
-                        ]
-                    ],
-                }
+    if rich_text:
+        payload = {
+            "msg_type": "post",
+            "content": {
+                "post": {
+                    "zh_cn": {
+                        "title": "羽毛球场地剩余",
+                        "content": [
+                            [
+                                {
+                                    "tag": "text",
+                                    "text": content,
+                                }
+                            ]
+                        ],
+                    }
+                },
             },
-        },
-    }
+        }
+    else:
+        payload = {
+            "msg_type": "text",
+            "content": {
+                "text": content,
+            },
+        }
 
     try:
         response = requests.post(
@@ -821,7 +925,7 @@ def main():
     logger.info("开始监控预约页面...")
     webhooks = get_webhooks()
 
-    if not webhooks["feishu"] and not webhooks["wework"]:
+    if not webhooks["feishu_group"] and not webhooks["wework"]:
         logger.warning("未配置飞书或企业微信Webhook，仅在控制台输出结果")
 
     # while True:
@@ -836,20 +940,40 @@ def main():
         logger.error(f"运行出错: {e}")
 
     if is_available:
-        report_data = {"message": message}
-        if webhooks["feishu"]:
-            send_to_feishu(
-                webhooks["feishu"],
-                report_data,
-                report_type="text",
-            )
-        if webhooks["wework"]:
-            send_wework(
-                webhooks["wework"],
-                title="羽毛球场地有名额！",
-                content=message,
-                url=TARGET_URL,
-            )
+        # 将消息按行拆分为单条场地描述
+        lines = [ln.strip() for ln in str(message).splitlines() if ln.strip()]
+        # 过滤已经达到提醒阈值的场地
+        try:
+            to_notify, _ = filter_messages_by_memory(lines)
+        except Exception as e:
+            logger.warning(f"过滤提醒记忆时出错，将直接发送全部消息: {e}")
+            to_notify = lines
+
+        if not to_notify:
+            logger.info("所有发现的场地均被记忆阈值抑制，今日不再发送通知")
+        else:
+            new_message = "\n".join(to_notify)
+            report_data = {"message": new_message}
+            if webhooks["feishu_group"]:
+                send_to_feishu(
+                    webhooks["feishu_group"],
+                    report_data,
+                    report_type="text",
+                )
+            if webhooks["feishu_person"]:
+                send_to_feishu(
+                    webhooks["feishu_person"],
+                    report_data,
+                    report_type="text",
+                    rich_text=False,
+                )
+            if webhooks["wework"]:
+                send_wework(
+                    webhooks["wework"],
+                    title="羽毛球场地有名额！",
+                    content=new_message,
+                    url=TARGET_URL,
+                )
 
 
 if __name__ == "__main__":
