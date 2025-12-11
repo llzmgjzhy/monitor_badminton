@@ -5,8 +5,9 @@ import requests
 import yaml
 import logging
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
+import re
 import pytz
 from dotenv import load_dotenv
 from typing import Dict, List, Tuple, Optional, Union
@@ -248,6 +249,91 @@ def filter_messages_by_memory(
     return to_notify, updated
 
 
+def build_continuous_periods(
+    lines: List[str], include_morning: bool = True
+) -> List[str]:
+    """从单小时条目中构建同一天的连续时段（只按时间连续，不要求同一场地）。
+    返回格式化的通知行列表，每行为: "{date_key} | 连续空余 {HH:MM}-{HH:MM} ({N}小时)"。
+    期望输入行包含时间段，如 "12-02 周二 | 场地A (08:00-09:00)" 或类似格式。
+    """
+    pools = {}
+    # 匹配左侧日期部分与时间段
+    # 捕获左边任意文本（用于提取日期键）与括号内时间
+    time_re = re.compile(
+        r"^(?P<left>.*?)\|.*\((?P<start>\d{1,2}[:：]\d{2})\s*-\s*(?P<end>\d{1,2}[:：]\d{2})\)"
+    )
+
+    # 准备一个函数来规范化日期键（尽量提取 YYYY-MM-DD 或 MM-DD 或 中文月日）
+    def normalize_date_key(left: str) -> str:
+        left = left.strip()
+        if not left:
+            return left
+        # 常见日期格式优先匹配
+        dm = re.search(
+            r"(\d{4}[-/]\d{1,2}[-/]\d{1,2})|(\d{1,2}-\d{1,2})|(\d{1,2}月\d{1,2}日)",
+            left,
+        )
+        if dm:
+            return dm.group(0)
+        # 否则尽量取第一个 token（例如 "12-02 周二" -> "12-02" 或 "12-02 周二 上午" -> "12-02"）
+        token = left.split()[0]
+        return token
+
+    for line in lines:
+        if not line:
+            continue
+        if not include_morning and "上午" in line:
+            continue
+        m = time_re.search(line)
+        if not m:
+            continue
+        left = m.group("left")
+        date_key = normalize_date_key(left)
+        start = m.group("start").replace("：", ":")
+        try:
+            sh, sm = [int(x) for x in start.split(":")]
+        except Exception:
+            continue
+        start_min = sh * 60 + sm
+        pools.setdefault(date_key, set()).add(start_min)
+
+    result = []
+    for date_key, starts in pools.items():
+        seq = sorted(starts)
+        if not seq:
+            continue
+        cur_start = seq[0]
+        cur_prev = seq[0]
+        cur_len = 1
+        for s in seq[1:]:
+            if s == cur_prev + 60:
+                cur_prev = s
+                cur_len += 1
+            else:
+                if cur_len >= 2:
+                    st_h, st_m = divmod(cur_start, 60)
+                    end_min = cur_prev + 60
+                    en_h, en_m = divmod(end_min, 60)
+                    hours = cur_len
+                    result.append(
+                        f"{date_key} | 连续空余 {st_h:02d}:{st_m:02d}-{en_h:02d}:{en_m:02d} ({hours}小时)"
+                    )
+                cur_start = s
+                cur_prev = s
+                cur_len = 1
+
+        if cur_len >= 2:
+            st_h, st_m = divmod(cur_start, 60)
+            end_min = cur_prev + 60
+            en_h, en_m = divmod(end_min, 60)
+            hours = cur_len
+            result.append(
+                f"{date_key} | 连续空余 {st_h:02d}:{st_m:02d}-{en_h:02d}:{en_m:02d} ({hours}小时)"
+            )
+
+    return result
+
+
 def check_dates_availability(driver):
     """轮询检查每一天的场地情况"""
     days_count = get_check_days_count()
@@ -420,11 +506,7 @@ def send_to_feishu(
     if proxy_url:
         proxies = {"http": proxy_url, "https": proxy_url}
 
-    content = process_report_data(report_data, report_type)
-    if not content:
-        print(f"无内容可发送到飞书 [{report_type}]，跳过发送")
-        return True
-
+    content = report_data.get("message", "")
     if rich_text:
         payload = {
             "msg_type": "post",
@@ -942,38 +1024,54 @@ def main():
     if is_available:
         # 将消息按行拆分为单条场地描述
         lines = [ln.strip() for ln in str(message).splitlines() if ln.strip()]
-        # 过滤已经达到提醒阈值的场地
-        try:
-            to_notify, _ = filter_messages_by_memory(lines)
-        except Exception as e:
-            logger.warning(f"过滤提醒记忆时出错，将直接发送全部消息: {e}")
-            to_notify = lines
+        include_morning = os.environ.get("INCLUDE_MORNING", "false").lower() == "true"
 
-        if not to_notify:
-            logger.info("所有发现的场地均被记忆阈值抑制，今日不再发送通知")
+        # 删除上午数据（若配置为不包含上午），再在所有场地信息中寻找同一天连续 >=2 小时的时段
+        filtered_lines = [ln for ln in lines if include_morning or "上午" not in ln]
+
+        # 合并为连续时段（按时间连续，不要求同一场地），只保留 >=2 小时的段
+        if int(os.environ.get("LEAST_TIME_LENGTH", "1")) >= 2:
+            merged = build_continuous_periods(
+                filtered_lines, include_morning=include_morning
+            )
         else:
-            new_message = "\n".join(to_notify)
-            report_data = {"message": new_message}
-            if webhooks["feishu_group"]:
-                send_to_feishu(
-                    webhooks["feishu_group"],
-                    report_data,
-                    report_type="text",
-                )
-            if webhooks["feishu_person"]:
-                send_to_feishu(
-                    webhooks["feishu_person"],
-                    report_data,
-                    report_type="text",
-                    rich_text=False,
-                )
-            if webhooks["wework"]:
-                send_wework(
-                    webhooks["wework"],
-                    title="羽毛球场地有名额！",
-                    content=new_message,
-                    url=TARGET_URL,
-                )
+            merged = filtered_lines
+
+        if not merged:
+            logger.info("未找到任何同一天连续 >=2 小时的空余时段，跳过通知")
+        else:
+            # 过滤已经达到提醒阈值的时段
+            try:
+                to_notify, _ = filter_messages_by_memory(merged)
+            except Exception as e:
+                logger.warning(f"过滤提醒记忆时出错，将直接发送全部消息: {e}")
+                to_notify = merged
+
+            if not to_notify:
+                logger.info("所有发现的连续时段均被记忆阈值抑制，今日不再发送通知")
+            else:
+                new_message = "\n".join(to_notify)
+                report_data = {"message": new_message}
+                if webhooks["feishu_person"]:
+                    send_to_feishu(
+                        webhooks["feishu_person"],
+                        report_data,
+                        report_type="text",
+                        rich_text=False,
+                    )
+                if webhooks["feishu_group"]:
+                    send_to_feishu(
+                        webhooks["feishu_group"],
+                        report_data,
+                        report_type="text",
+                    )
+                if webhooks["wework"]:
+                    send_wework(
+                        webhooks["wework"],
+                        title="羽毛球场地有名额！",
+                        content=new_message,
+                        url=TARGET_URL,
+                    )
 
 
 if __name__ == "__main__":
