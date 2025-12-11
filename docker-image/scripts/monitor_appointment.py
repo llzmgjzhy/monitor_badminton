@@ -279,7 +279,11 @@ def build_continuous_periods(
         if dm:
             return dm.group(0)
         # 否则尽量取第一个 token（例如 "12-02 周二" -> "12-02" 或 "12-02 周二 上午" -> "12-02"）
-        token = left.split()[0]
+        token = (
+            f"{left.split()[0]} {left.split()[1]}"
+            if len(left.split()) > 1
+            else left.split()[0]
+        )
         return token
 
     for line in lines:
@@ -319,7 +323,7 @@ def build_continuous_periods(
                     en_h, en_m = divmod(end_min, 60)
                     hours = cur_len
                     result.append(
-                        f"{date_key} | 连续空余 {st_h:02d}:{st_m:02d}-{en_h:02d}:{en_m:02d} ({hours}小时)"
+                        f"{date_key} | {st_h:02d}:{st_m:02d}-{en_h:02d}:{en_m:02d} ({hours}小时)"
                     )
                 cur_start = s
                 cur_prev = s
@@ -331,7 +335,7 @@ def build_continuous_periods(
             en_h, en_m = divmod(end_min, 60)
             hours = cur_len
             result.append(
-                f"{date_key} | 连续空余 {st_h:02d}:{st_m:02d}-{en_h:02d}:{en_m:02d} ({hours}小时)"
+                f"{date_key} | {st_h:02d}:{st_m:02d}-{en_h:02d}:{en_m:02d} ({hours}小时)"
             )
 
     return result
