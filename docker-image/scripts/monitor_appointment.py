@@ -38,6 +38,9 @@ logger = logging.getLogger(__name__)
 # === 配置部分 (请在此处修改目标URL和判断逻辑) ===
 TARGET_URL = os.environ.get("TARGET_URL")  # 目标页面URL
 CHECK_INTERVAL = 60  # 检查间隔(秒)
+LEAST_TIME_LENGTH = int(
+    os.environ.get("LEAST_TIME_LENGTH", "1")
+)  # 最短时间长度(小时)，字符串形式以便后续处理
 
 # cookies 保存路径（与 docker-compose 的 ./data 挂载一致）
 COOKIES_PATH = Path("./data/browser_cookies.json")
@@ -310,7 +313,7 @@ def build_continuous_periods(
                 cur_prev = s
                 cur_len += 1
             else:
-                if cur_len >= 2:
+                if cur_len >= LEAST_TIME_LENGTH:
                     st_h, st_m = divmod(cur_start, 60)
                     end_min = cur_prev + 60
                     en_h, en_m = divmod(end_min, 60)
@@ -322,7 +325,7 @@ def build_continuous_periods(
                 cur_prev = s
                 cur_len = 1
 
-        if cur_len >= 2:
+        if cur_len >= LEAST_TIME_LENGTH:
             st_h, st_m = divmod(cur_start, 60)
             end_min = cur_prev + 60
             en_h, en_m = divmod(end_min, 60)
@@ -1030,7 +1033,7 @@ def main():
         filtered_lines = [ln for ln in lines if include_morning or "上午" not in ln]
 
         # 合并为连续时段（按时间连续，不要求同一场地），只保留 >=2 小时的段
-        if int(os.environ.get("LEAST_TIME_LENGTH", "1")) >= 2:
+        if LEAST_TIME_LENGTH >= 2:
             merged = build_continuous_periods(
                 filtered_lines, include_morning=include_morning
             )
