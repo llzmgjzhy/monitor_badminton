@@ -272,12 +272,12 @@ def build_continuous_periods(
         if not left:
             return left
         # 常见日期格式优先匹配
-        dm = re.search(
-            r"(\d{4}[-/]\d{1,2}[-/]\d{1,2})|(\d{1,2}-\d{1,2})|(\d{1,2}月\d{1,2}日)",
-            left,
-        )
-        if dm:
-            return dm.group(0)
+        # dm = re.search(
+        #     r"(\d{4}[-/]\d{1,2}[-/]\d{1,2})|(\d{1,2}-\d{1,2})|(\d{1,2}月\d{1,2}日)",
+        #     left,
+        # )
+        # if dm:
+        #     return dm.group(0)
         # 否则尽量取第一个 token（例如 "12-02 周二" -> "12-02" 或 "12-02 周二 上午" -> "12-02"）
         token = (
             f"{left.split()[0]} {left.split()[1]}"
