@@ -778,6 +778,26 @@ def handle_login_process(driver):
 
 def navigate_to_venue(driver):
     """导航到津南羽毛球馆预约页面"""
+
+    def close_weui_dialog():
+        """如果出现 weui 弹窗，点击确定关闭（避免遮挡）"""
+        try:
+            dialog_button = driver.find_elements(
+                By.XPATH,
+                "//div[contains(@class,'weui-dialog__ft')]//a[contains(@class,'weui-dialog__btn_primary') and normalize-space(text())='确定']",
+            )
+            if dialog_button:
+                logger.info("检测到weui弹窗，点击‘确定’关闭")
+                dialog_button[0].click()
+                time.sleep(1)
+                return True
+        except Exception as e:
+            logger.debug(f"关闭weui弹窗失败: {e}")
+        return False
+
+    # 尝试先关闭任意阻塞弹窗（如温馨提示）
+    close_weui_dialog()
+
     # 1. 点击场地预订
     logger.info("正在查找'场地预订'按钮...")
     try:
@@ -787,10 +807,16 @@ def navigate_to_venue(driver):
         )
         if venue_booking_btn:
             logger.info("找到'场地预订'按钮，正在点击...")
-            venue_booking_btn[0].click()
+            try:
+                venue_booking_btn[0].click()
+            except Exception as e:
+                logger.warning(f"点击'场地预订'失败，尝试关闭阻塞弹窗后重试: {e}")
+                close_weui_dialog()
+                venue_booking_btn[0].click()
             time.sleep(5)
         else:
             logger.info("未找到按钮，尝试直接跳转到场地预订页面...")
+            close_weui_dialog()
             driver.get(
                 "https://tyggl.nankai.edu.cn/Views/Venue/VenueList.html?Type=Field"
             )
@@ -888,7 +914,7 @@ def check_availability():
         chrome_options.add_argument("--ignore-certificate-errors")
 
         # headless 支持（在 monitor 容器中通常启用）
-        headless_env = os.environ.get("HEADLESS", "true").lower()
+        headless_env = os.environ.get("HEADLESS", "false").lower()
         if headless_env in ("1", "true", "yes"):
             # 使用新的 headless 模式（Chrome 109+ 支持）
             try:
