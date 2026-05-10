@@ -56,11 +56,13 @@ RUN apt-get update \
 
 # Create non-root user
 RUN useradd -m monitor
-WORKDIR /home/monitor
+WORKDIR /app
 
-# Copy scripts
+COPY ./app /app
 COPY ./scripts /scripts
-RUN chown -R monitor:monitor /scripts
+RUN mkdir -p /data \
+    && chmod +x /scripts/monitor_loop.sh \
+    && chown -R monitor:monitor /app /scripts /data
 
 # Install python deps (if any; keep minimal)
 RUN pip install --no-cache-dir selenium requests pyyaml python-dotenv pytz
@@ -70,4 +72,4 @@ USER monitor
 
 ENV PATH="/usr/local/bin:$PATH"
 
-CMD ["/bin/sh", "-c", "while true; do python /scripts/monitor_appointment.py || true; sleep ${MONITOR_INTERVAL:-300}; done"]
+CMD ["/bin/sh", "/scripts/monitor_loop.sh"]

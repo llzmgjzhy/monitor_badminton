@@ -3,13 +3,17 @@ services:
   monitor:
     build:
       context: .
-      dockerfile: Dockerfile.monitor
+      dockerfile: docker/Dockerfile.monitor
     container_name: wxbot-monitor
     restart: always
+    env_file:
+      - ./.env
     environment:
       - PYTHONUNBUFFERED=1
-      - MONITOR_INTERVAL=300
       - HEADLESS=true
+      - DATA_DIR=/data
     volumes:
+      - ./app:/app
       - ./scripts:/scripts
-    working_dir: /scripts
+      - ./data:/data
+    working_dir: /app

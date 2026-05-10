@@ -42,11 +42,13 @@ LEAST_TIME_LENGTH = int(
     os.environ.get("LEAST_TIME_LENGTH", "1")
 )  # 最短时间长度(小时)，字符串形式以便后续处理
 
-# cookies 保存路径（与 docker-compose 的 ./data 挂载一致）
-COOKIES_PATH = Path("./data/browser_cookies.json")
+DATA_DIR = Path(os.environ.get("DATA_DIR", "./data"))
 
-# 已提醒记忆文件（用于抑制重复提醒），建议在 compose 中挂载 `./data:/data`
-MEMORY_PATH = Path("./data/seen_slots.json")
+# cookies 保存路径（容器内默认由 docker-compose 挂载到 /data）
+COOKIES_PATH = DATA_DIR / "browser_cookies.json"
+
+# 已提醒记忆文件（用于抑制重复提醒）
+MEMORY_PATH = DATA_DIR / "seen_slots.json"
 # 在同一天内允许的提醒次数阈值（超过该值后将抑制后续提醒），默认允许2次（即第1、2次会提醒，第3次开始抑制）
 try:
     MEMORY_THRESHOLD = int(os.environ.get("MEMORY_THRESHOLD", "2"))
@@ -912,9 +914,8 @@ def check_availability():
         chrome_options.add_argument("--no-sandbox")
         # 忽略证书错误
         chrome_options.add_argument("--ignore-certificate-errors")
-
         # headless 支持（在 monitor 容器中通常启用）
-        headless_env = os.environ.get("HEADLESS", "false").lower()
+        headless_env = os.environ.get("HEADLESS", "true").lower()
         if headless_env in ("1", "true", "yes"):
             # 使用新的 headless 模式（Chrome 109+ 支持）
             try:
@@ -929,7 +930,7 @@ def check_availability():
             "yes",
         )
         if use_profile:
-            profile_dir = os.environ.get("CHROME_PROFILE_DIR", "./data/chrome_profile")
+            profile_dir = os.environ.get("CHROME_PROFILE_DIR", str(DATA_DIR / "chrome_profile"))
             try:
                 chrome_options.add_argument(
                     f"--user-data-dir={Path(profile_dir).as_posix()}"
@@ -959,6 +960,8 @@ def check_availability():
         # 初始化后尝试加载 cookies（若存在），以恢复登录状态；若未加载再访问目标页面
         try:
             loaded = load_cookies(driver, TARGET_URL)
+            driver.get(TARGET_URL)
+            time.sleep(5)
         except Exception:
             loaded = False
 
@@ -992,10 +995,10 @@ def check_availability():
         else:
             logger.info("登录框已消失，登录流程已完成")
             # 登录成功后保存 cookies 以便下次复用
-            try:
-                save_cookies(driver)
-            except Exception:
-                logger.debug("保存 cookies 时发生异常，已忽略")
+            # try:
+            #     save_cookies(driver)
+            # except Exception:
+            #     logger.debug("保存 cookies 时发生异常，已忽略")
         # ===================
 
         # 导航到目标场馆
@@ -1008,11 +1011,11 @@ def check_availability():
         logger.error(f"检查页面失败: {e}")
         return False, f"检查出错: {e}"
     finally:
-        # if driver:
-        #     try:
-        #         driver.quit()
-        #     except:
-        #         return True, "未发现'已满'标记，可能有名额！"
+        if driver:
+            try:
+                driver.quit()
+            except:
+                return True, "未发现'已满'标记，可能有名额！"
         print("结束检查")
 
 

@@ -1,10 +1,9 @@
 .vscode
+__pycache__/
 
 *.apk
 /virtual_machine/
 
 .env
-
-browser_cookies.json
 
 *.json
